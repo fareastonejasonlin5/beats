@@ -19,14 +19,15 @@ package virtualmachine
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net/url"
 	"strings"
+	"encoding/json"
 
+	"github.com/elastic/beats/v7/libbeat/common"
 	"github.com/elastic/beats/v7/metricbeat/mb"
-	"github.com/elastic/beats/v7/metricbeat/module/vsphere"
-	"github.com/elastic/elastic-agent-libs/mapstr"
 
+	"github.com/pkg/errors"
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
@@ -38,26 +39,25 @@ import (
 
 func init() {
 	mb.Registry.MustAddMetricSet("vsphere", "virtualmachine", New,
-		mb.WithHostParser(vsphere.HostParser),
 		mb.DefaultMetricSet(),
 	)
 }
 
-// MetricSet type defines all fields of the MetricSet.
+// MetricSet type defines all fields of the MetricSet
 type MetricSet struct {
-	*vsphere.MetricSet
+	mb.BaseMetricSet
+	HostURL         *url.URL
+	Insecure        bool
 	GetCustomFields bool
 }
 
-// New creates a new instance of the MetricSet.
+// New create a new instance of the MetricSet
 func New(base mb.BaseMetricSet) (mb.MetricSet, error) {
-	ms, err := vsphere.NewMetricSet(base)
-	if err != nil {
-		return nil, err
-	}
-
 	config := struct {
-		GetCustomFields bool `config:"get_custom_fields"`
+		Username        string `config:"username"`
+		Password        string `config:"password"`
+		Insecure        bool   `config:"insecure"`
+		GetCustomFields bool   `config:"get_custom_fields"`
 	}{
 		GetCustomFields: false,
 	}
@@ -65,8 +65,18 @@ func New(base mb.BaseMetricSet) (mb.MetricSet, error) {
 	if err := base.Module().UnpackConfig(&config); err != nil {
 		return nil, err
 	}
+
+	u, err := url.Parse(base.HostData().URI)
+	if err != nil {
+		return nil, err
+	}
+
+	u.User = url.UserPassword(config.Username, config.Password)
+
 	return &MetricSet{
-		MetricSet:       ms,
+		BaseMetricSet:   base,
+		HostURL:         u,
+		Insecure:        config.Insecure,
 		GetCustomFields: config.GetCustomFields,
 	}, nil
 }
@@ -80,12 +90,12 @@ func (m *MetricSet) Fetch(ctx context.Context, reporter mb.ReporterV2) error {
 
 	client, err := govmomi.NewClient(ctx, m.HostURL, m.Insecure)
 	if err != nil {
-		return fmt.Errorf("error in NewClient: %w", err)
+		return errors.Wrap(err, "error in NewClient")
 	}
 
 	defer func() {
 		if err := client.Logout(ctx); err != nil {
-			m.Logger().Debug(fmt.Errorf("error trying to logout from vshphere: %w", err))
+			m.Logger().Debug(errors.Wrap(err, "error trying to logout from vshphere"))
 		}
 	}()
 
@@ -97,7 +107,7 @@ func (m *MetricSet) Fetch(ctx context.Context, reporter mb.ReporterV2) error {
 		var err error
 		customFieldsMap, err = setCustomFieldsMap(ctx, c)
 		if err != nil {
-			return fmt.Errorf("error in setCustomFieldsMap: %w", err)
+			return errors.Wrap(err, "error in setCustomFieldsMap")
 		}
 	}
 
@@ -106,81 +116,105 @@ func (m *MetricSet) Fetch(ctx context.Context, reporter mb.ReporterV2) error {
 
 	v, err := mgr.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"VirtualMachine"}, true)
 	if err != nil {
-		return fmt.Errorf("error in CreateContainerView: %w", err)
+		return errors.Wrap(err, "error in CreateContainerView")
 	}
 
 	defer func() {
 		if err := v.Destroy(ctx); err != nil {
-			m.Logger().Debug(fmt.Errorf("error trying to destroy view from vshphere: %w", err))
+			m.Logger().Debug(errors.Wrap(err, "error trying to destroy view from vshphere"))
 		}
 	}()
 
 	// Retrieve summary property for all machines
 	var vmt []mo.VirtualMachine
-	err = v.Retrieve(ctx, []string{"VirtualMachine"}, []string{"summary"}, &vmt)
+	err = v.Retrieve(ctx, []string{"VirtualMachine"}, []string{"summary","guest","runtime"}, &vmt)
 	if err != nil {
-		return fmt.Errorf("error in Retrieve: %w", err)
+		return errors.Wrap(err, "error in Retrieve")
 	}
+	
 
 	for _, vm := range vmt {
-		usedMemory := int64(vm.Summary.QuickStats.GuestMemoryUsage) * 1024 * 1024
-		usedCPU := vm.Summary.QuickStats.OverallCpuUsage
-		event := mapstr.M{
+		freeMemory := (int64(vm.Summary.Config.MemorySizeMB) * 1024 * 1024) - (int64(vm.Summary.QuickStats.GuestMemoryUsage) * 1024 * 1024)
+
+		event := common.MapStr{
 			"name": vm.Summary.Config.Name,
 			"os":   vm.Summary.Config.GuestFullName,
-			"cpu": mapstr.M{
-				"used": mapstr.M{
-					"mhz": usedCPU,
+			"cpu": common.MapStr{
+				"used": common.MapStr{
+					"mhz": vm.Summary.QuickStats.OverallCpuUsage,
 				},
 			},
-			"memory": mapstr.M{
-				"used": mapstr.M{
-					"guest": mapstr.M{
-						"bytes": usedMemory,
+			"memory": common.MapStr{
+				"used": common.MapStr{
+					"guest": common.MapStr{
+						"bytes": (int64(vm.Summary.QuickStats.GuestMemoryUsage) * 1024 * 1024),
 					},
-					"host": mapstr.M{
+					"host": common.MapStr{
 						"bytes": int64(vm.Summary.QuickStats.HostMemoryUsage) * 1024 * 1024,
 					},
 				},
+				"total": common.MapStr{
+					"guest": common.MapStr{
+						"bytes": int64(vm.Summary.Config.MemorySizeMB) * 1024 * 1024,
+					},
+				},
+				"free": common.MapStr{
+					"guest": common.MapStr{
+						"bytes": freeMemory,
+					},
+				},
 			},
 		}
-
-		totalCPU := vm.Summary.Config.CpuReservation
-		if totalCPU > 0 {
-			freeCPU := totalCPU - usedCPU
-			// Avoid negative values if reported used CPU is slightly over total configured.
-			if freeCPU < 0 {
-				freeCPU = 0
+		
+		if vm.Runtime.MaxCpuUsage > 0 {
+			event.Put("guest.cpu.max.mhz", vm.Runtime.MaxCpuUsage)
+		}
+		
+		if vm.Summary.Guest != nil {
+			event["guest.toolsstatus"] = vm.Summary.Guest.ToolsStatus
+			if vm.Summary.Guest.ToolsStatus == "toolsOk" || vm.Summary.Guest.ToolsStatus == "toolsOld" {
+				if vm.Guest != nil {
+					var strsBdr strings.Builder
+					vgdj, err := json.MarshalIndent(vm.Guest.Disk, "", "  ")
+					if err == nil {
+						fmt.Fprintf(&strsBdr, fmt.Sprintf(`%s`, vgdj))
+					} else {
+						m.Logger().Debug(fmt.Sprintf("json.Marshal(vgd) error: %+v\n", err.Error() ))
+						continue
+					}
+					event.Put("guest.disk.info", strsBdr.String())
+				} else {
+					m.Logger().Debug("vm.Guest not found. ")
+				}
 			}
-			event.Put("cpu.total.mhz", totalCPU)
-			event.Put("cpu.free.mhz", freeCPU)
+
+		} else {
+			m.Logger().Debug("vm.Summary.Guest not found. ")
 		}
 
-		totalMemory := int64(vm.Summary.Config.MemorySizeMB) * 1024 * 1024
-		if totalMemory > 0 {
-			freeMemory := totalMemory - usedMemory
-			// Avoid negative values if reported used memory is slightly over total configured.
-			if freeMemory < 0 {
-				freeMemory = 0
-			}
-			event.Put("memory.total.guest.bytes", totalMemory)
-			event.Put("memory.free.guest.bytes", freeMemory)
-		}
-
-		if host := vm.Summary.Runtime.Host; host != nil {
-			event["host.id"] = host.Value
-			hostSystem, err := getHostSystem(ctx, c, host.Reference())
-			if err == nil {
-				event["host.hostname"] = hostSystem.Summary.Config.Name
-			} else {
-				m.Logger().Debug(err.Error())
-			}
+		if vm.Summary.Runtime.Host != nil {
+			event["host.id"] = vm.Summary.Runtime.Host.Value
 		} else {
 			m.Logger().Debug("'Host', 'Runtime' or 'Summary' data not found. This is either a parsing error " +
 				"from vsphere library, an error trying to reach host/guest or incomplete information returned " +
 				"from host/guest")
 		}
 
+		hostSystem, err := getHostSystem(ctx, c, vm.Summary.Runtime.Host.Reference())
+		if err != nil {
+			m.Logger().Debug(err.Error())
+		} else {
+			event["host.hostname"] = hostSystem.Summary.Config.Name
+			totalCPU := int64(hostSystem.Summary.Hardware.CpuMhz) * int64(hostSystem.Summary.Hardware.NumCpuCores)
+			if totalCPU > 0 {
+				event.Put("host.cpu.total.mhz", totalCPU)
+			}
+			
+			vmgcpupct := int64(hostSystem.Summary.Hardware.CpuMhz) * int64(vm.Summary.Config.NumCpu)
+			event.Put("guest.cpu.total.mhz", vmgcpupct)
+			
+		}
+		
 		// Get custom fields (attributes) values if get_custom_fields is true.
 		if m.GetCustomFields && vm.Summary.CustomValue != nil {
 			customFields := getCustomFields(vm.Summary.CustomValue, customFieldsMap)
@@ -213,8 +247,8 @@ func (m *MetricSet) Fetch(ctx context.Context, reporter mb.ReporterV2) error {
 	return nil
 }
 
-func getCustomFields(customFields []types.BaseCustomFieldValue, customFieldsMap map[int32]string) mapstr.M {
-	outputFields := mapstr.M{}
+func getCustomFields(customFields []types.BaseCustomFieldValue, customFieldsMap map[int32]string) common.MapStr {
+	outputFields := common.MapStr{}
 	for _, v := range customFields {
 		customFieldString := v.(*types.CustomFieldStringValue)
 		key, ok := customFieldsMap[v.GetCustomFieldValue().Key]
@@ -278,11 +312,11 @@ func setCustomFieldsMap(ctx context.Context, client *vim25.Client) (map[int32]st
 	customFieldsManager, err := object.GetCustomFieldsManager(client)
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to get custom fields manager: %w", err)
+		return nil, errors.Wrap(err, "failed to get custom fields manager")
 	}
 	field, err := customFieldsManager.Field(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get custom fields: %w", err)
+		return nil, errors.Wrap(err, "failed to get custom fields")
 	}
 
 	for _, def := range field {
